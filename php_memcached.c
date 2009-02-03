@@ -1302,6 +1302,71 @@ PHP_METHOD(Memcached, addServer)
 }
 /* }}} */
 
+/* {{{ Memcached::addServers(array servers)
+   Adds the given memcache servers to the server list */
+PHP_METHOD(Memcached, addServers)
+{
+	zval *servers;
+	zval **entry;
+	zval **z_host, **z_port, **z_weight = NULL;
+	uint32_t weight = 0;
+	int   entry_size, i = 0;
+	memcached_server_st *list = NULL;
+	memcached_return status;
+	MEMC_METHOD_INIT_VARS;
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a/", &servers) == FAILURE) {
+		return;
+	}
+
+	MEMC_METHOD_FETCH_OBJECT;
+	MEMC_G(rescode) = MEMCACHED_SUCCESS;
+
+	for (zend_hash_internal_pointer_reset(Z_ARRVAL_P(servers)), i = 0;
+		 zend_hash_get_current_data(Z_ARRVAL_P(servers), (void **)&entry) == SUCCESS;
+		 zend_hash_move_forward(Z_ARRVAL_P(servers)), i++) {
+
+		if (Z_TYPE_PP(entry) != IS_ARRAY) {
+			php_error_docref(NULL TSRMLS_CC, E_WARNING, "server list entry #%d is not an array", i+1);
+			continue;
+		}
+
+		entry_size = zend_hash_num_elements(Z_ARRVAL_PP(entry));
+
+		if (entry_size > 1) {
+			zend_hash_index_find(Z_ARRVAL_PP(entry), 0, (void **)&z_host);
+			zend_hash_index_find(Z_ARRVAL_PP(entry), 1, (void **)&z_port);
+			convert_to_string_ex(z_host);
+			convert_to_long_ex(z_port);
+
+			weight = 0;
+			if (entry_size > 2) {
+				zend_hash_index_find(Z_ARRVAL_PP(entry), 2, (void **)&z_weight);
+				convert_to_long_ex(z_weight);
+				weight = Z_LVAL_PP(z_weight);
+			}
+
+			list = memcached_server_list_append_with_weight(list, Z_STRVAL_PP(z_host),
+															Z_LVAL_PP(z_port), weight, &status);
+
+			if (php_memc_handle_error(status TSRMLS_CC) == 0) {
+				continue;
+			}
+		}
+
+		php_error_docref(NULL TSRMLS_CC, E_WARNING, "could not add entry #%d to the server list", i+1);
+	}
+
+	status = memcached_server_push(i_obj->memc, list);
+	memcached_server_list_free(list);
+	if (php_memc_handle_error(status TSRMLS_CC) < 0) {
+		RETURN_FALSE;
+	}
+
+	RETURN_TRUE;
+}
+/* }}} */
+
 /* {{{ Memcached::getServerList()
    Returns the list of the memcache servers in use */
 PHP_METHOD(Memcached, getServerList)
@@ -1547,6 +1612,25 @@ static PHP_METHOD(Memcached, setOption)
 			}
 			break;
 		}
+
+		case MEMCACHED_BEHAVIOR_KETAMA_WEIGHTED:
+			flag = (memcached_behavior) option;
+			convert_to_long(value);
+			if (memcached_behavior_set(i_obj->memc, flag, (uint64_t)Z_LVAL_P(value)) == MEMCACHED_FAILURE) {
+				php_error_docref(NULL TSRMLS_CC, E_WARNING, "error setting memcached option");
+				RETURN_FALSE;
+			}
+
+			/*
+			 * This is necessary because libmemcached does not reset hash/distribution
+			 * options on false case, like it does for MEMCACHED_BEHAVIOR_KETAMA
+			 * (non-weighted) case. We have to clean up ourselves.
+			 */
+			if (!Z_LVAL_P(value)) {
+				i_obj->memc->hash = 0;
+				i_obj->memc->distribution = 0;
+			}
+			break;
 
 		default:
 			/*
@@ -2344,6 +2428,11 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_addServer, 0, 0, 2)
 ZEND_END_ARG_INFO()
 
 static
+ZEND_BEGIN_ARG_INFO(arginfo_addServers, 0)
+	ZEND_ARG_ARRAY_INFO(0, servers, 0)
+ZEND_END_ARG_INFO()
+
+static
 ZEND_BEGIN_ARG_INFO(arginfo_getServerList, 0)
 ZEND_END_ARG_INFO()
 
@@ -2406,6 +2495,7 @@ static zend_function_entry memcached_class_methods[] = {
     MEMC_ME(decrement,          arginfo_decrement)
 
     MEMC_ME(addServer,          arginfo_addServer)
+    MEMC_ME(addServers,         arginfo_addServers)
     MEMC_ME(getServerList,      arginfo_getServerList)
     MEMC_ME(getServerByKey,     arginfo_getServerByKey)
 
@@ -2483,7 +2573,7 @@ static void php_memc_register_constants(INIT_FUNC_ARGS)
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_DISTRIBUTION, MEMCACHED_BEHAVIOR_DISTRIBUTION);
 	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_MODULA, MEMCACHED_DISTRIBUTION_MODULA);
 	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_CONSISTENT, MEMCACHED_DISTRIBUTION_CONSISTENT);
-	REGISTER_MEMC_CLASS_CONST_LONG(DISTRIBUTION_KETAMA_WEIGHTED, MEMCACHED_BEHAVIOR_KETAMA_WEIGHTED);
+	REGISTER_MEMC_CLASS_CONST_LONG(OPT_LIBKETAMA_COMPATIBLE, MEMCACHED_BEHAVIOR_KETAMA_WEIGHTED);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_BUFFER_WRITES, MEMCACHED_BEHAVIOR_BUFFER_REQUESTS);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_BINARY_PROTOCOL, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL);
 	REGISTER_MEMC_CLASS_CONST_LONG(OPT_NO_BLOCK, MEMCACHED_BEHAVIOR_NO_BLOCK);
@@ -2587,7 +2677,6 @@ PHP_MINFO_FUNCTION(memcached)
 	php_info_print_table_start();
 	php_info_print_table_header(2, "memcached support", "enabled");
 	php_info_print_table_row(2, "Version", PHP_MEMCACHED_VERSION);
-	php_info_print_table_row(2, "Revision", "$Revision: 1.1 $");
 	php_info_print_table_row(2, "libmemcached version", memcached_lib_version());
 	php_info_print_table_end();
 }
